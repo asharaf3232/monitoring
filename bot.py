@@ -1,4 +1,4 @@
-# bot_final_corrected.py
+# bot_final_v2.py (الإصدار النهائي مع تصحيح Asyncio)
 
 import os
 import json
@@ -38,6 +38,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, 'trade_history.json')
 positions_lock = threading.Lock()
 open_positions = {}
 trade_history = []
+main_event_loop = None # متغير لتخزين حلقة الأحداث الرئيسية
 
 # =================================================================
 # SECTION 1: الدوال المساعدة
@@ -105,7 +106,8 @@ async def get_full_portfolio_details():
     headers = get_auth_headers("GET", "/api/v5/account/balance")
     try:
         async with asyncio.timeout(10):
-            response = await asyncio.to_thread(requests.get, url, headers=headers)
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(None, lambda: requests.get(url, headers=headers))
             response.raise_for_status()
             data = response.json()
             if data.get("code") == "0":
@@ -121,7 +123,8 @@ async def get_market_price(asset):
     url = f"https://www.okx.com/api/v5/market/ticker?instId={asset}-USDT"
     try:
         async with asyncio.timeout(5):
-            response = await asyncio.to_thread(requests.get, url)
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(None, lambda: requests.get(url))
             response.raise_for_status()
             data = response.json()
             if data.get("code") == "0" and data.get("data"):
@@ -149,63 +152,89 @@ async def generate_and_send_daily_report():
     await send_telegram_message(report_message)
 
 async def _handle_message_async(payload):
-    if payload.get("arg", {}).get("channel") == "account" and "data" in payload:
-        logging.info("Received account update.")
-        portfolio_state = await get_full_portfolio_details()
-        if not portfolio_state: return
-        current_balances = {d['ccy']: float(d['eq']) for d in payload["data"][0]["details"]}
-        with positions_lock:
-            all_assets = set(current_balances.keys()) | set(open_positions.keys())
-            for asset in all_assets:
-                if asset == 'USDT': continue
-                current_qty = current_balances.get(asset, 0); position = open_positions.get(asset); known_qty = position['total_qty'] if position else 0
-                difference = current_qty - known_qty; price = asyncio.run(get_market_price(asset))
-                if not price or abs(difference * price) < 1.0: continue
-                if difference > 0: # BUY
-                    trade_value = difference * price
-                    if not position:
-                        entry_capital_percent = (trade_value / portfolio_state['total_value']) * 100
-                        open_positions[asset] = {'id': f"{asset}-{int(time.time())}", 'total_qty': current_qty, 'avg_buy_price': price, 'total_cost': trade_value, 'open_date': datetime.utcnow().isoformat(), 'total_sold_value': 0, 'total_sold_qty': 0, 'entry_capital_percent': entry_capital_percent}
-                        details = {'asset': asset, 'price': price, 'trade_size_percent': entry_capital_percent, 'cash_consumed_percent': (trade_value / (portfolio_state['usdt_value'] + trade_value)) * 100, 'remaining_cash_percent': (portfolio_state['usdt_value'] / portfolio_state['total_value']) * 100}
-                        asyncio.run(send_telegram_message(format_new_buy_message(details)))
-                    else:
-                        new_total_cost = position['total_cost'] + trade_value; new_total_qty = position['total_qty'] + difference
-                        position.update({'avg_buy_price': new_total_cost / new_total_qty, 'total_qty': new_total_qty, 'total_cost': new_total_cost})
-                        details = {'asset': asset, 'price': price, 'new_avg_price': position['avg_buy_price'], 'added_qty': difference}
-                        asyncio.run(send_telegram_message(format_add_to_position_message(details)))
-                    save_positions()
-                elif difference < 0: # SELL
-                    if not position: continue
-                    sold_qty = abs(difference); sold_value = sold_qty * price
-                    position.update({'total_sold_value': position['total_sold_value'] + sold_value, 'total_sold_qty': position['total_sold_qty'] + sold_qty})
-                    if current_qty < 0.000001:
-                        duration = datetime.utcnow() - datetime.fromisoformat(position['open_date']); avg_sell_price = position['total_sold_value'] / position['total_sold_qty'] if position['total_sold_qty'] > 0 else price; roi = ((avg_sell_price - position['avg_buy_price']) / position['avg_buy_price']) * 100
-                        details = {'asset': asset, 'avg_buy_price': position['avg_buy_price'], 'avg_sell_price': avg_sell_price, 'roi': roi, 'duration_days': duration.total_seconds() / 86400}
-                        asyncio.run(send_telegram_message(format_close_trade_message(details)))
-                        history_data = {**details, 'closed_at': datetime.utcnow().isoformat(), 'entry_capital_percent': position.get('entry_capital_percent', 0)}
-                        append_to_trade_history(history_data); del open_positions[asset]
-                    else:
-                        position['total_qty'] = current_qty; pnl_percent = ((price - position['avg_buy_price']) / position['avg_buy_price']) * 100
-                        details = {'asset': asset, 'price': price, 'sold_percent': (sold_qty / known_qty) * 100, 'pnl_percent': pnl_percent}
-                        asyncio.run(send_telegram_message(format_partial_sell_message(details)))
-                    save_positions()
+    if not (payload.get("arg", {}).get("channel") == "account" and "data" in payload): return
+    
+    logging.info("Received account update.")
+    portfolio_state = await get_full_portfolio_details()
+    if not portfolio_state: return
+
+    current_balances = {d['ccy']: float(d['eq']) for d in payload["data"][0]["details"]}
+    
+    with positions_lock:
+        all_assets = set(current_balances.keys()) | set(open_positions.keys())
+        tasks = []
+
+        for asset in all_assets:
+            if asset == 'USDT': continue
+            
+            current_qty = current_balances.get(asset, 0)
+            position = open_positions.get(asset)
+            known_qty = position['total_qty'] if position else 0
+            difference = current_qty - known_qty
+            
+            # Create a task to handle each asset
+            tasks.append(process_asset_change(asset, difference, current_qty, known_qty, position, portfolio_state))
+        
+        # Run all asset processing tasks concurrently
+        if tasks:
+            await asyncio.gather(*tasks)
+
+async def process_asset_change(asset, difference, current_qty, known_qty, position, portfolio_state):
+    price = await get_market_price(asset)
+    if not price or abs(difference * price) < 1.0: return
+
+    if difference > 0:  # BUY
+        trade_value = difference * price
+        if not position:
+            entry_capital_percent = (trade_value / portfolio_state['total_value']) * 100
+            open_positions[asset] = {'id': f"{asset}-{int(time.time())}", 'total_qty': current_qty, 'avg_buy_price': price, 'total_cost': trade_value, 'open_date': datetime.utcnow().isoformat(), 'total_sold_value': 0, 'total_sold_qty': 0, 'entry_capital_percent': entry_capital_percent}
+            details = {'asset': asset, 'price': price, 'trade_size_percent': entry_capital_percent, 'cash_consumed_percent': (trade_value / (portfolio_state['usdt_value'] + trade_value)) * 100, 'remaining_cash_percent': (portfolio_state['usdt_value'] / portfolio_state['total_value']) * 100}
+            await send_telegram_message(format_new_buy_message(details))
+        else:
+            new_total_cost = position['total_cost'] + trade_value
+            new_total_qty = position['total_qty'] + difference
+            position.update({'avg_buy_price': new_total_cost / new_total_qty, 'total_qty': new_total_qty, 'total_cost': new_total_cost})
+            details = {'asset': asset, 'price': price, 'new_avg_price': position['avg_buy_price'], 'added_qty': difference}
+            await send_telegram_message(format_add_to_position_message(details))
+        save_positions()
+    elif difference < 0:  # SELL
+        if not position: return
+        sold_qty = abs(difference)
+        sold_value = sold_qty * price
+        position.update({'total_sold_value': position['total_sold_value'] + sold_value, 'total_sold_qty': position['total_sold_qty'] + sold_qty})
+        
+        if current_qty < 0.000001:
+            duration = datetime.utcnow() - datetime.fromisoformat(position['open_date'])
+            avg_sell_price = position['total_sold_value'] / position['total_sold_qty'] if position['total_sold_qty'] > 0 else price
+            roi = ((avg_sell_price - position['avg_buy_price']) / position['avg_buy_price']) * 100
+            details = {'asset': asset, 'avg_buy_price': position['avg_buy_price'], 'avg_sell_price': avg_sell_price, 'roi': roi, 'duration_days': duration.total_seconds() / 86400}
+            await send_telegram_message(format_close_trade_message(details))
+            history_data = {**details, 'closed_at': datetime.utcnow().isoformat(), 'entry_capital_percent': position.get('entry_capital_percent', 0)}
+            append_to_trade_history(history_data)
+            del open_positions[asset]
+        else:
+            position['total_qty'] = current_qty
+            pnl_percent = ((price - position['avg_buy_price']) / position['avg_buy_price']) * 100
+            details = {'asset': asset, 'price': price, 'sold_percent': (sold_qty / known_qty) * 100, 'pnl_percent': pnl_percent}
+            await send_telegram_message(format_partial_sell_message(details))
+        save_positions()
 
 # =================================================================
 # SECTION 2: OKX WebSocket Client
 # =================================================================
 class OKXWebSocketClient:
     def __init__(self, url):
-        self.ws_url = url; self.ws_app = None; self.thread = None
+        self.ws_url = url
+        self.ws_app = None
+        self.thread = None
 
     def _generate_signature(self, timestamp):
-        # --- التصحيح النهائي بناءً على كودك الاحترافي ---
         message = timestamp + 'GET' + '/users/self/verify'
         mac = hmac.new(bytes(OKX_API_SECRET_KEY, 'utf-8'), bytes(message, 'utf-8'), digestmod='sha256')
         return base64.b64encode(mac.digest()).decode()
 
     def _on_open(self, ws):
         logging.info("WebSocket connection opened. Sending login payload...")
-        # --- استخدام Unix Timestamp الرقمي ---
         current_timestamp = str(time.time())
         login_payload = {
             "op": "login",
@@ -235,7 +264,10 @@ class OKXWebSocketClient:
             else:
                 logging.error(f"WebSocket login failed: {payload.get('msg')}")
         elif payload.get("arg", {}).get("channel") == "account":
-            asyncio.run(_handle_message_async(payload))
+            # --- هذا هو التصحيح ---
+            if main_event_loop and main_event_loop.is_running():
+                asyncio.run_coroutine_threadsafe(_handle_message_async(payload), main_event_loop)
+            # ---------------------
 
     def _on_error(self, ws, error): logging.error(f"WebSocket Error: {error}")
     def _on_close(self, ws, close_status_code, close_msg): logging.warning("WebSocket closed. Reconnecting..."); time.sleep(5); self.connect()
@@ -249,17 +281,24 @@ class OKXWebSocketClient:
 # =================================================================
 
 async def main():
+    global main_event_loop
+    main_event_loop = asyncio.get_running_loop()
+
     if not all([TELEGRAM_BOT_TOKEN, TARGET_CHANNEL_ID, OKX_API_KEY, OKX_API_SECRET_KEY, OKX_API_PASSPHRASE]):
         logging.critical("FATAL: One or more environment variables are missing. Exiting."); exit(1)
-    logging.info("Starting Final Spy Bot...")
+    
+    logging.info("Starting Final Spy Bot (v2)...")
     load_data()
+    
     scheduler = AsyncIOScheduler(timezone="CET")
     hour, minute = map(int, REPORT_TIME_CET.split(':'))
     scheduler.add_job(generate_and_send_daily_report, 'cron', hour=hour, minute=minute)
     scheduler.start()
     logging.info(f"Daily report scheduled for {REPORT_TIME_CET} CET.")
+    
     ws_client = OKXWebSocketClient("wss://ws.okx.com:8443/ws/v5/private")
     ws_client.connect()
+    
     logging.info("Bot is running and monitoring trades...")
     try:
         while True: await asyncio.sleep(3600)
@@ -267,5 +306,8 @@ async def main():
         scheduler.shutdown(); logging.info("Bot stopped by user.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logging.critical(f"Bot failed to start: {e}", exc_info=True)
 
