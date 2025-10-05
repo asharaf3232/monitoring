@@ -1,4 +1,4 @@
-# bot_final.py (النسخة الكاملة والنهائية بدون أي أجزاء هيكلية)
+# bot_final_corrected.py
 
 import os
 import json
@@ -40,7 +40,7 @@ open_positions = {}
 trade_history = []
 
 # =================================================================
-# SECTION 1: دوال إدارة الملفات، الرسائل، وواجهة برمجة التطبيقات
+# SECTION 1: الدوال المساعدة
 # =================================================================
 
 def load_data():
@@ -72,29 +72,27 @@ def append_to_trade_history(trade_data):
 async def send_telegram_message(message_text):
     try:
         await telegram_bot.send_message(chat_id=TARGET_CHANNEL_ID, text=message_text, parse_mode='Markdown')
-        logging.info("Message sent to Telegram channel.")
     except Exception as e:
         logging.error(f"Failed to send message to Telegram: {e}")
 
+# --- دوال تنسيق الرسائل ---
 def format_new_buy_message(details):
     asset, price, trade_size_percent, cash_consumed_percent, remaining_cash_percent = details.values()
     return (f"💡 توصية جديدة: بناء مركز في {asset} 🟢\n" f"━━━━━━━━━━━━━━━━━━━━\n" f"الأصل: {asset}/USDT\n" f"سعر الدخول الحالي: ${price:,.4f}\n" f"━━━━━━━━━━━━━━━━━━━━\n" f"استراتيجية إدارة المحفظة:\n" f" ▪️ حجم الدخول: تم تخصيص {trade_size_percent:.2f}% من المحفظة لهذه الصفقة.\n" f" ▪️ استهلاك السيولة: استهلك هذا الدخول {cash_consumed_percent:.2f}% من السيولة النقدية المتاحة.\n" f" ▪️ السيولة المتبقية: بعد الصفقة، أصبحت السيولة تشكل {remaining_cash_percent:.2f}% من المحفظة.\n" f"━━━━━━━━━━━━━━━━━━━━\n" f"ملاحظات:\n" f"نرى في هذه المستويات فرصة واعدة. المراقبة مستمرة، وسنوافيكم بتحديثات إدارة الصفقة.\n" f"#توصية #{asset}")
-
 def format_add_to_position_message(details):
     asset, price, new_avg_price, added_qty = details.values()
     return (f"⚙️ تحديث التوصية: تعزيز مركز {asset} 🟢\n" f"━━━━━━━━━━━━━━━━━━━━\n" f"تمت إضافة كمية `{added_qty:.6f}` بسعر ${price:,.4f}.\n\n" f"متوسط سعر الدخول الجديد للمركز هو `${new_avg_price:,.4f}`.\n" f"نستمر في متابعة الأهداف.\n" f"#إدارة_مخاطر #{asset}")
-
 def format_partial_sell_message(details):
     asset, price, sold_percent, pnl_percent = details.values()
     pnl_emoji = "🟢" if pnl_percent >= 0 else "🔴"
     return (f"⚙️ تحديث التوصية: إدارة مركز {asset} 🟠\n" f"━━━━━━━━━━━━━━━━━━━━\n" f"الأصل: {asset}/USDT\n" f"سعر البيع الجزئي: ${price:,.4f}\n" f"━━━━━━━━━━━━━━━━━━━━\n" f"استراتيجية إدارة المحفظة:\n" f" ▪️ الإجراء: تم بيع {sold_percent:.2f}% من مركزنا لتأمين الأرباح.\n" f" ▪️ النتيجة: ربح محقق على الجزء المباع بنسبة {pnl_percent:+.2f}% {pnl_emoji}.\n" f" ▪️ حالة المركز: لا يزال المركز مفتوحًا بالكمية المتبقية.\n" f"━━━━━━━━━━━━━━━━━━━━\n" f"ملاحظات:\n" f"خطوة استباقية لإدارة المخاطر وحماية رأس المال. نستمر في متابعة الأهداف الأعلى.\n" f"#إدارة_مخاطر #{asset}")
-
 def format_close_trade_message(details):
     asset, avg_buy_price, avg_sell_price, roi, duration_days = details.values()
     pnl_emoji = "🟢" if roi >= 0 else "🔴"
     conclusion = ("صفقة موفقة أثبتت أن الصبر على التحليل يؤتي ثماره." if roi >= 0 else "الخروج بانضباط وفقًا للخطة هو نجاح بحد ذاته. نحافظ على رأس المال للفرصة القادمة.")
     return (f"🏆 النتيجة النهائية لتوصية {asset} {'✅' if roi >= 0 else '☑️'}\n" f"━━━━━━━━━━━━━━━━━━━━\n" f"الأصل: {asset}/USDT\n" f"الحالة: تم إغلاق الصفقة بالكامل.\n" f"━━━━━━━━━━━━━━━━━━━━\n" f"ملخص أداء التوصية:\n" f" ▪️ متوسط سعر الدخول: ${avg_buy_price:,.4f}\n" f" ▪️ متوسط سعر الخروج: ${avg_sell_price:,.4f}\n" f" ▪️ العائد النهائي على الاستثمار (ROI): {roi:+.2f}% {pnl_emoji}\n" f" ▪️ مدة التوصية: {duration_days:.1f} يوم\n" f"━━━━━━━━━━━━━━━━━━━━\n" f"الخلاصة:\n{conclusion}\n\n" f"نبارك لمن اتبع التوصية. نستعد الآن للبحث عن الفرصة التالية.\n" f"#نتائجتوصيات #{asset}")
 
+# --- دوال جلب البيانات ---
 def get_auth_headers(method, request_path, body=""):
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
     body_str = json.dumps(body) if isinstance(body, dict) and body else ""
@@ -200,12 +198,15 @@ class OKXWebSocketClient:
         self.ws_url = url; self.ws_app = None; self.thread = None
 
     def _generate_signature(self, timestamp):
-        prehash = timestamp + "GET" + "/users/self/verify"
-        return base64.b64encode(hmac.new(OKX_API_SECRET_KEY.encode(), prehash.encode(), digestmod='sha256').digest()).decode()
+        # --- التصحيح النهائي بناءً على كودك الاحترافي ---
+        message = timestamp + 'GET' + '/users/self/verify'
+        mac = hmac.new(bytes(OKX_API_SECRET_KEY, 'utf-8'), bytes(message, 'utf-8'), digestmod='sha256')
+        return base64.b64encode(mac.digest()).decode()
 
     def _on_open(self, ws):
         logging.info("WebSocket connection opened. Sending login payload...")
-        current_timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        # --- استخدام Unix Timestamp الرقمي ---
+        current_timestamp = str(time.time())
         login_payload = {
             "op": "login",
             "args": [{
@@ -228,13 +229,12 @@ class OKXWebSocketClient:
         if message == 'pong': return
         payload = json.loads(message)
         if payload.get("event") == "login":
-            if payload.get("success"):
+            if payload.get("success") or payload.get("code") == "0":
                 logging.info("WebSocket login successful.")
                 ws.send(json.dumps({"op": "subscribe", "args": [{"channel": "account"}]}))
             else:
                 logging.error(f"WebSocket login failed: {payload.get('msg')}")
         elif payload.get("arg", {}).get("channel") == "account":
-            # Running the async handler in a new loop
             asyncio.run(_handle_message_async(payload))
 
     def _on_error(self, ws, error): logging.error(f"WebSocket Error: {error}")
